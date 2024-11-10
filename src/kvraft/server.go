@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -21,7 +23,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 const (
-	HandleOpTimeOut = time.Millisecond * 500
+	HandleOpTimeOut = time.Millisecond * 2000
 )
 
 type OType int
@@ -63,11 +65,22 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 	maxMapLen    int
 	db           map[string]string
+	persister    *raft.Persister
+	lastApplied  int
 
 	// Your definitions here.
 }
 
 func (kv *KVServer) HandleOp(opArgs *Op) (res result) {
+	kv.mu.Lock()
+	if hasMap, exist := kv.historyMap[opArgs.Identifier]; exist {
+		if hasMap.LastSeq == opArgs.Seq {
+			kv.mu.Unlock()
+			return *hasMap
+		}
+	}
+	kv.mu.Unlock()
+
 	startIndex, startTerm, isLeader := kv.rf.Start(*opArgs)
 	//fmt.Printf("HandleOp: OP: %v\n", *opArgs)
 	if !isLeader {
@@ -75,7 +88,7 @@ func (kv *KVServer) HandleOp(opArgs *Op) (res result) {
 	}
 
 	kv.mu.Lock()
-
+	// 协程处理完毕
 	newCh := make(chan result)
 	kv.waiCh[startIndex] = &newCh
 	kv.mu.Unlock()
@@ -108,12 +121,6 @@ func (kv *KVServer) HandleOp(opArgs *Op) (res result) {
 }
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	_, isLeader := kv.rf.GetState()
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
 	opArgs := &Op{
 		OpType:     OPGet,
 		Seq:        args.Seq,
@@ -136,12 +143,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	_, isLeader := kv.rf.GetState()
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
 	opArgs := &Op{
 		OpType:     OPPut,
 		Seq:        args.Seq,
@@ -157,12 +158,6 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	_, isLeader := kv.rf.GetState()
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
 	opArgs := &Op{
 		OpType:     OPAppend,
 		Seq:        args.Seq,
@@ -195,7 +190,7 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-func (kv *KVServer) DBExecute(op *Op, isLeader bool) (res result) {
+func (kv *KVServer) DBExecute(op *Op) (res result) {
 	res.LastSeq = op.Seq
 	switch op.OpType {
 	case OPGet:
@@ -236,6 +231,13 @@ func (kv *KVServer) ApplyHandler() {
 			//fmt.Printf("ApplyHandler : op = %v\n", op)
 			kv.mu.Lock()
 
+			if log.CommandIndex <= kv.lastApplied {
+				kv.mu.Unlock()
+				continue
+			}
+
+			kv.lastApplied = log.CommandIndex
+
 			var res result
 
 			needApply := false
@@ -249,43 +251,81 @@ func (kv *KVServer) ApplyHandler() {
 				needApply = true
 			}
 
-			_, isLeader := kv.rf.GetState()
-
 			if needApply {
 				// fmt.Printf("ApplyHandler : op = %v\n", op)
 				// fmt.Printf("ApplyHandler : Command = %v\n", log.Command)
-				res = kv.DBExecute(&op, isLeader)
+				res = kv.DBExecute(&op)
 				res.ResTerm = log.SnapshotTerm
 				kv.historyMap[op.Identifier] = &res
 			}
 
-			if !isLeader {
-				kv.mu.Unlock()
-				continue
-			}
-
 			// Leader还需要额外通知handler处理clerk回复
 			ch, exist := kv.waiCh[log.CommandIndex]
-			if !exist {
-				// 接收端的通道已经被删除了并且当前节点是 leader, 说明这是重复的请求, 但这种情况不应该出现, 所以panic
-				DPrintf("leader %v ApplyHandler 发现 identifier %v Seq %v 的管道不存在, 应该是超时被关闭了", kv.me, op.Identifier, op.Seq)
+			if exist {
 				kv.mu.Unlock()
-				continue
+				// 发送消息
+				func() {
+					defer func() {
+						if recover() != nil {
+							// 如果这里有 panic，是因为通道关闭
+							fmt.Printf("leader %v ApplyHandler: 发现 identifier %v Seq %v 的管道不存在, 应该是超时被关闭了", kv.me, op.Identifier, op.Seq)
+						}
+					}()
+					res.ResTerm = log.SnapshotTerm
+
+					*ch <- res
+				}()
+				kv.mu.Lock()
+			}
+
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate/100*95 {
+				snapShot := kv.GenSnapShot()
+				kv.rf.Snapshot(log.CommandIndex, snapShot)
 			}
 			kv.mu.Unlock()
-			// 发送消息
-			func() {
-				defer func() {
-					if recover() != nil {
-						// 如果这里有 panic，是因为通道关闭
-						DPrintf("leader %v ApplyHandler 发现 identifier %v Seq %v 的管道不存在, 应该是超时被关闭了", kv.me, op.Identifier, op.Seq)
-					}
-				}()
-				res.ResTerm = log.SnapshotTerm
-				*ch <- res
-			}()
 
+		} else if log.SnapshotValid {
+			kv.mu.Lock()
+			if log.SnapshotIndex >= kv.lastApplied {
+				kv.LoadSnapShot(log.Snapshot)
+				kv.lastApplied = log.SnapshotIndex
+			}
+			kv.mu.Unlock()
 		}
+	}
+}
+
+func (kv *KVServer) GenSnapShot() []byte {
+	// 调用时必须持有锁mu
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(kv.db)
+	e.Encode(kv.historyMap)
+
+	serverState := w.Bytes()
+	return serverState
+}
+
+func (kv *KVServer) LoadSnapShot(snapShot []byte) {
+	// 调用时必须持有锁mu
+	if len(snapShot) == 0 || snapShot == nil {
+		//fmt.Printf("server %v LoadSnapShot: 快照为空", kv.me)
+		return
+	}
+
+	r := bytes.NewBuffer(snapShot)
+	d := labgob.NewDecoder(r)
+
+	tmpDB := make(map[string]string)
+	tmpHistoryMap := make(map[int64]*result)
+	if d.Decode(&tmpDB) != nil ||
+		d.Decode(&tmpHistoryMap) != nil {
+		//fmt.Printf("server %v LoadSnapShot 加载快照失败\n", kv.me)
+	} else {
+		kv.db = tmpDB
+		kv.historyMap = tmpHistoryMap
+		// fmt.Printf("server %v LoadSnapShot 加载快照成功\n", kv.me)
 	}
 }
 
@@ -314,10 +354,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 
 	kv.historyMap = make(map[int64]*result)
 	kv.db = make(map[string]string)
 	kv.waiCh = make(map[int]*chan result)
+
+	kv.mu.Lock()
+	kv.LoadSnapShot(persister.ReadSnapshot())
+	kv.mu.Unlock()
 
 	go kv.ApplyHandler()
 	// You may need initialization code here.

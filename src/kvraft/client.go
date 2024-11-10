@@ -2,7 +2,7 @@
  * @Author       : wenwneyuyu
  * @Date         : 2024-09-20 16:41:46
  * @LastEditors  : wenwenyuyu
- * @LastEditTime : 2024-11-08 20:25:30
+ * @LastEditTime : 2024-11-10 15:01:12
  * @FilePath     : /src/kvraft/client.go
  * @Description  :
  * Copyright 2024 OBKoro1, All Rights Reserved.
@@ -13,8 +13,13 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
+	"time"
 
 	"6.5840/labrpc"
+)
+
+const (
+	RpcRetryInterval = time.Millisecond * 50
 )
 
 type Clerk struct {
@@ -73,6 +78,7 @@ func (ck *Clerk) Get(key string) string {
 		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrLeaderOutDated {
 			ck.leaderId = ck.leaderId + 1
 			ck.leaderId %= len(ck.servers)
+			time.Sleep(RpcRetryInterval)
 			continue
 		}
 
@@ -113,6 +119,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrLeaderOutDated {
 			ck.leaderId = ck.leaderId + 1
 			ck.leaderId %= len(ck.servers)
+			time.Sleep(RpcRetryInterval)
 			continue
 		}
 		switch reply.Err {
